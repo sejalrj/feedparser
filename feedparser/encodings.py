@@ -43,6 +43,7 @@ else:
         return chardet.detect(data)['encoding'] or ''
 
 from .exceptions import (
+    CharacterEncodingErrorsReplace,
     CharacterEncodingOverride,
     CharacterEncodingUnknown,
     NonXMLContentType,
@@ -204,6 +205,21 @@ def convert_to_utf8(http_headers, data, result):
     http_content_type = http_headers.get('content-type') or ''
     http_content_type, http_encoding = parse_content_type(http_content_type)
 
+    # Some UTF-8 documents may contain invalid characters, resulting in
+    # falling back to lazy_chardet_encoding or iso-8859-2.
+    # In such a case, lazy_chardet_encoding may not be able to detect the
+    # encoding correctly, and iso-8859-2 is apparently a wrong guess.
+
+    # Therefore, we use the flag to allow decoding UTF-8 documents with
+    # errors='replace'.
+
+    # Considering the fact that UTF-8 is the most popular encoding,
+    # the flag can be safely set if any metadata of the document explicitly
+    # indicates that the encoding is UTF-8.
+
+    # 1st pass: adhere to HTTP encoding (Content-Type)
+    utf_8_confident = http_encoding == "utf-8"
+
     acceptable_content_type = 0
     application_content_types = ('application/xml', 'application/xml-dtd',
                                  'application/xml-external-parsed-entity')
@@ -218,6 +234,11 @@ def convert_to_utf8(http_headers, data, result):
             )
     ):
         acceptable_content_type = 1
+        # 2nd pass: adhere to the declared XML encoding
+        #           (but not in the inconsistent case)
+        utf_8_confident = utf_8_confident or (
+            xml_encoding == 'utf-8' and not http_encoding
+        )
         rfc3023_encoding = http_encoding or xml_encoding or 'utf-8'
     elif (
             http_content_type in text_content_types
@@ -282,18 +303,30 @@ def convert_to_utf8(http_headers, data, result):
         try:
             data = data.decode(proposed_encoding)
         except (UnicodeDecodeError, LookupError):
-            pass
-        else:
-            known_encoding = 1
-            if not json:
-                # Update the encoding in the opening XML processing instruction.
-                new_declaration = '''<?xml version='1.0' encoding='utf-8'?>'''
-                if RE_XML_DECLARATION.search(data):
-                    data = RE_XML_DECLARATION.sub(new_declaration, data)
-                else:
-                    data = new_declaration + '\n' + data
-            data = data.encode('utf-8')
-            break
+            if proposed_encoding != 'utf-8' or not utf_8_confident:
+                continue
+            # try utf-8 with errors='replace' if we are confident
+            try:
+                data = data.decode('utf-8', errors="replace")
+            except (UnicodeDecodeError, LookupError):
+                continue
+            else:
+                error = CharacterEncodingErrorsReplace(
+                    'document explicitly declared its encoding as utf-8, '
+                    'but has encoding errors, '
+                    'which has been replaced with � (U+FFFD)'
+                )
+
+        known_encoding = 1
+        if not json:
+            # Update the encoding in the opening XML processing instruction.
+            new_declaration = '''<?xml version='1.0' encoding='utf-8'?>'''
+            if RE_XML_DECLARATION.search(data):
+                data = RE_XML_DECLARATION.sub(new_declaration, data)
+            else:
+                data = new_declaration + '\n' + data
+        data = data.encode('utf-8')
+        break
     # if still no luck, give up
     if not known_encoding:
         error = CharacterEncodingUnknown(
